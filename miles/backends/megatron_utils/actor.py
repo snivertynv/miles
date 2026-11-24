@@ -10,6 +10,7 @@ from megatron.training.async_utils import maybe_finalize_async_save
 from torch_memory_saver import torch_memory_saver
 
 from miles.backends.megatron_utils.checkpoint_request import MegatronCkptLoadConfig
+from miles.backends.megatron_utils.device_timeline import DeviceTimeline
 from miles.backends.megatron_utils.hf_export import save_hf_model
 from miles.backends.megatron_utils.lora.bridge_adapter_slots import BridgeAdapterSlots
 from miles.backends.megatron_utils.lora.checkpoint import build_adapter_slots
@@ -49,7 +50,7 @@ from miles.backends.training_utils.weight_update.updater import WeightUpdater
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train_actor import TrainRayActor, WeightUpdateOutput
-from miles.utils import object_store
+from miles.utils import object_store, observers
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.args.custom_view import compute_custom_function_config
 from miles.utils.audit_utils.config_snapshot.dumper import ConfigSnapshotDumper
@@ -131,6 +132,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     @with_defer(lambda: Timer().start("train_wait"))
+    @observers.observed("rank.init", category="init")
     def init(
         self,
         args: Pickled,
@@ -648,7 +650,10 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
 
-        with timer(f"{store_prefix}log_probs"):
+        with (
+            timer(f"{store_prefix}log_probs"),
+            DeviceTimeline().collect(rollout_id=rollout_id, phase=f"{store_prefix}log_probs"),
+        ):
             return forward_only(
                 get_log_probs_and_entropy,
                 self.args,
@@ -667,6 +672,7 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_id=rollout_id, attempt=attempt
         )
     )
+    @observers.observed("rank.train_step", category="step")
     def train(
         self,
         rollout_id: int,
@@ -868,7 +874,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             num_rollouts = get_num_rollouts(self.args, rollout_data, num_optimizer_steps)
             self._set_replay_stage("replay_backward")
-            with timer("actor_train"):
+            with timer("actor_train"), DeviceTimeline().collect(rollout_id=rollout_id, phase="actor_train"):
                 self._log_first_train_config()
                 train_step_outcome = train(
                     self.args,

@@ -16,7 +16,7 @@ from miles.ray.train.cell import TrainerCell
 from miles.ray.train.cell_monitor import create_trainer_cell_health_checker
 from miles.ray.train.init_request import TrainerControllerInitRequest
 from miles.ray.train_actor import WeightUpdateOutput
-from miles.utils import object_store
+from miles.utils import object_store, observers
 from miles.utils.args.runtime import TrainerConfig
 from miles.utils.arguments import supports_partial_target_weight_update
 from miles.utils.async_utils import AsyncioGatherUtils, gather_and_raise_first
@@ -179,6 +179,7 @@ class TrainerController:
 
     # ------------------------ API :: train ------------------------
 
+    @observers.observed("trainer.train", category="train")
     async def train(
         self,
         rollout_id: int,
@@ -333,6 +334,7 @@ class TrainerController:
     # ------------------------ API :: others ------------------------
 
     @init_once
+    @observers.observed("trainer.init", category="init")
     async def init(self, request: TrainerControllerInitRequest) -> list[Any]:
         """
         Observe the controller's cells, then allocate GPU resources and initialize
@@ -346,6 +348,7 @@ class TrainerController:
             args, source=TrainerControllerProcessIdentity(trainer_id=self._trainer_id, model_id=args.trainer_model_id)
         )
         object_store.init_instance(args, contribute_segment=False)
+        observers.start_process("trainer_controller")
 
         if args.indep_dp:
             self._indep_dp_store, self._indep_dp_store_addr = create_tcp_store()
@@ -392,6 +395,7 @@ class TrainerController:
     async def is_initialized(self) -> bool:
         return self._init_once.is_initialized()
 
+    @observers.observed("trainer.load_state", category="checkpoint")
     async def load_state(self, request: TrainerControllerInitRequest) -> list[Any]:
         assert self._init_once.is_initialized()
 
@@ -406,6 +410,7 @@ class TrainerController:
         self._debug_trainer_load_state_timestamp = time.time()
         return [item for sublist in cell_results for item in sublist]
 
+    @observers.observed("trainer.save_model", category="checkpoint")
     async def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         """Save actor model. Only cell 0 saves to avoid file write conflicts."""
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
@@ -414,6 +419,7 @@ class TrainerController:
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
 
+    @observers.observed("trainer.export_hf", category="checkpoint")
     async def export_hf(self, rollout_id: int, path: str) -> None:
         """Export current weights as an HF checkpoint. Only cell 0 exports to avoid file write conflicts."""
         await retry(
@@ -421,6 +427,7 @@ class TrainerController:
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
 
+    @observers.observed("trainer.update_weights", category="weight_sync")
     async def update_weights(self, info: UpdatableEngines, rollout_id: int | None = None) -> WeightUpdateOutput:
         """Broadcast weights to rollout engines and return which of them now serve which version."""
         log_structured(logger.info, tag="ft", op="update_weights", phase="start", rollout=rollout_id)
@@ -522,6 +529,7 @@ class TrainerController:
     async def get_deployment_identity(self) -> DeploymentIdentity:
         return self._deployment_identity
 
+    @observers.observed("trainer.onload", category="offload")
     async def onload(self) -> None:
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
         await self._execute_all_alive_and_catch("wake_up")
@@ -535,15 +543,18 @@ class TrainerController:
         finally:
             self._health_checker_activeness.bump_active(True)
 
+    @observers.observed("trainer.offload", category="offload")
     async def offload(self) -> None:
         self._health_checker_activeness.bump_active(False)
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
         await self._execute_all_alive_and_catch("sleep")
 
+    @observers.observed("trainer.clear_memory", category="offload")
     async def clear_memory(self) -> None:
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
         await self._execute_all_alive_and_catch("clear_memory")
 
+    @observers.observed("trainer.offload_grad_buffer", category="offload")
     async def offload_grad_buffer(self) -> None:
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
         await self._execute_all_alive_and_catch("offload_grad_buffer")

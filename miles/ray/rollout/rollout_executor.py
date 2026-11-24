@@ -231,6 +231,7 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
     # -------------------------- data generation -----------------------------
 
     @event_logger_context(lambda _self, rollout_id, trainer_model_id=None: dict(rollout_id=rollout_id))
+    @observers.observed("rollout.get", category="rollout")
     async def get(self, rollout_id: int, trainer_model_id: str | None = None) -> RolloutDataPack:
         self.last_get_rollout_id_of_model_id[trainer_model_id] = rollout_id
         self._unreleased_store_refs[rollout_id] = {}
@@ -250,7 +251,10 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
         # The dp schedule and a custom convert may leave rows out of the train data: collect from the samples.
         self._unreleased_store_refs[rollout_id] = store_refs_of(data) | take_dropped_refs()
 
-        with SampleOwnershipRecorder.suppress_drop_logging() if replay is not None else nullcontext():
+        with (
+            SampleOwnershipRecorder.suppress_drop_logging() if replay is not None else nullcontext(),
+            observers.span("rollout.dispatch", category="dispatch", rollout_id=rollout_id),
+        ):
             train_data = convert_samples_to_train_data(
                 self.args,
                 data,
@@ -269,6 +273,7 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
                 data_ref = [store.put(value=shard, value_spec=ROLLOUT_DATA_VALUE_SPEC) for shard in shards]
             return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref)
 
+    @observers.observed("rollout.release", category="dispatch")
     async def release(self, rollout_id: int) -> None:
         """Delete the output store objects of rollout ``rollout_id``, which has trained."""
         if not (refs := self._unreleased_store_refs.pop(rollout_id, None)):
@@ -450,6 +455,7 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
 
     # TODO the train and eval rollout functions will become one object, so one save/load is enough here
     # async but never awaits: the RPC layer runs sync methods on a thread, and an await-free coroutine is atomic against the rollout coroutines on this loop
+    @observers.observed("rollout.save", category="checkpoint")
     async def save(self, rollout_id: int, completed_rollout_ids: dict[str, int] | None = None) -> None:
         assert self.args.save is not None, "the orchestration only saves when --save is set"
 
@@ -468,6 +474,7 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
             self._output_snapshotter.save(dir_temp / _EXECUTOR_DIRNAME)
 
     # async but never awaits, for the same reason as save
+    @observers.observed("rollout.load", category="checkpoint")
     async def load(
         self, rollout_id: int, completed_rollout_ids: dict[str, int] | None = None, *, load: str | None
     ) -> None:

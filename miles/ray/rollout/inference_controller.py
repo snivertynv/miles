@@ -128,11 +128,13 @@ class InferenceController:
     # -------------------------- rollout lifecycle hooks -----------------------------
 
     @with_lock
+    @observers.observed("engine.prepare_rollout", category="engine")
     async def prepare_rollout(self, rollout_id: int, model_id: str | None = None) -> None:
         await self._health_monitoring_resume(model_id)
         await self._engine_topology_reporter.report_if_changed(self.servers, provider=self._engine_provider)
 
     @with_lock
+    @observers.observed("engine.prepare_eval", category="eval")
     async def prepare_eval(self, model_id: str | None = None) -> None:
         await self._health_monitoring_resume(model_id)
 
@@ -153,24 +155,29 @@ class InferenceController:
 
     # TODO may parallelly execute offload/onload across services
     @with_lock
+    @observers.observed("engine.offload", category="offload")
     async def offload(self, tags: list[str] | None = None) -> None:
         await self._offload(tags=tags)
 
     @with_lock
+    @observers.observed("engine.onload", category="offload")
     async def onload(self, tags: list[str] | None = None) -> None:
         await self._onload(tags=tags)
 
     @with_lock
+    @observers.observed("engine.onload_weights", category="offload")
     async def onload_weights(self) -> None:
         if "weight" not in self.args.offload_rollout_level:
             return
         await self._onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     @with_lock
+    @observers.observed("engine.onload_kv", category="offload")
     async def onload_kv(self) -> None:
         await self._onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
 
     @with_lock
+    @observers.observed("engine.offload_kv", category="offload")
     async def offload_kv(self) -> None:
         tags = [GPU_MEMORY_TYPE_CUDA_GRAPH]
         if "kv_cache" in self.args.offload_rollout_level:
@@ -178,6 +185,7 @@ class InferenceController:
         await self._offload(tags=tags)
 
     @with_lock
+    @observers.observed("engine.offload_weights", category="offload")
     async def offload_weights(self) -> None:
         if "weight" not in self.args.offload_rollout_level:
             return
@@ -197,20 +205,24 @@ class InferenceController:
     # -------------------------- generation pause -----------------------------
 
     @with_lock
+    @observers.observed("engine.pause_generation", category="engine")
     async def pause_generation(self, mode: str) -> None:
         await asyncio.gather(*[srv.pause_generation(mode=mode) for srv in self.servers.values()])
 
     @with_lock
+    @observers.observed("engine.continue_generation", category="engine")
     async def continue_generation(self) -> None:
         await asyncio.gather(*[srv.continue_generation() for srv in self.servers.values()])
 
     @with_lock
+    @observers.observed("engine.flush_cache", category="engine")
     async def flush_cache(self) -> None:
         await asyncio.gather(*[srv.flush_cache() for srv in self.servers.values()])
 
     # -------------------------- engine management -----------------------------
 
     @acquires_lock
+    @observers.observed("engine.start_update_weights", category="weight_sync")
     async def start_update_weights(
         self, model_id: str | None = None, receiver_pool: str = "rollout"
     ) -> "UpdatableEngines":
@@ -253,6 +265,7 @@ class InferenceController:
         self.context_lock.release_if_detached()
 
     @releases_lock
+    @observers.observed("engine.end_update_weights", category="weight_sync")
     async def end_update_weights(
         self,
         snapshot_cell_id_to_hashes: dict[str, str],

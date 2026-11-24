@@ -5,7 +5,7 @@ import os
 from miles.ray.placement_group import create_components, create_trainer_handles, maybe_start_api_server, update_weights
 from miles.ray.rollout.eval_dispatch import EvalDispatcher
 from miles.ray.specs.train import compute_trainer_configs
-from miles.utils import checkpoint_decay
+from miles.utils import checkpoint_decay, observers
 from miles.utils.arguments import validate_async_off_policy_correction
 from miles.utils.async_utils import Disposer, eager_create_task, with_disposer
 from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
@@ -83,6 +83,7 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
         else:
             await actor_model.clear_memory()
 
+    @observers.observed("driver.generate", category="rollout")
     async def prepare_and_generate(rollout_id):
         await inference_controller.prepare_rollout(rollout_id)
         return await rollout_executor.get(rollout_id)
@@ -90,95 +91,97 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
     # async train loop.
     rollout_data_next_future = await eager_create_task(prepare_and_generate(args.start_rollout_id))
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        # Sync the last generation
-        if rollout_data_next_future is not None:
-            rollout_data_curr_ref = await rollout_data_next_future
+        with observers.span("driver.step", category="step", rollout_id=rollout_id):
+            # Sync the last generation
+            if rollout_data_next_future is not None:
+                with observers.span("driver.wait_rollout", category="rollout", rollout_id=rollout_id):
+                    rollout_data_curr_ref = await rollout_data_next_future
 
-        has_next_rollout = rollout_id + 1 < args.num_rollout
-        weight_update_due = (rollout_id + 1) % args.update_weights_interval == 0
+            has_next_rollout = rollout_id + 1 < args.num_rollout
+            weight_update_due = (rollout_id + 1) % args.update_weights_interval == 0
 
-        # A fully-async producer keeps generating without a pending get(). When
-        # weights will change, defer the next drain so it uses the new version.
-        defer_next_drain = args.fully_async and has_next_rollout and weight_update_due
-        if args.colocate:
-            await inference_controller.pause_generation(mode=args.pause_generation_mode)
-            await inference_controller.flush_cache()
-            if args.offload_rollout:
-                await inference_controller.offload_kv()
-                await inference_controller.offload_weights()
-        else:
-            # Start the next rollout early.
-            if has_next_rollout and not defer_next_drain:
-                rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
+            # A fully-async producer keeps generating without a pending get(). When
+            # weights will change, defer the next drain so it uses the new version.
+            defer_next_drain = args.fully_async and has_next_rollout and weight_update_due
+            if args.colocate:
+                await inference_controller.pause_generation(mode=args.pause_generation_mode)
+                await inference_controller.flush_cache()
+                if args.offload_rollout:
+                    await inference_controller.offload_kv()
+                    await inference_controller.offload_weights()
+            else:
+                # Start the next rollout early.
+                if has_next_rollout and not defer_next_drain:
+                    rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
-        if args.use_critic:
-            values = await critic_model.train(rollout_id, rollout_data_curr_ref)
-            if args.offload_train:
-                await critic_model.offload()
-            if rollout_id >= args.num_critic_only_steps:
-                await actor_model.train(rollout_id, rollout_data_curr_ref, external_data=values)
-                if args.offload_train:
-                    await actor_model.offload()
-            remove_train_output_refs(values)
-        else:
-            await actor_model.train(rollout_id, rollout_data_curr_ref)
-        remove_rollout_data_refs(args, rollout_data_curr_ref)
-        await rollout_executor.release(rollout_id)
-
-        external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
-        if external_save or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
-            force_sync = external_save or rollout_id == args.num_rollout - 1
-            await save_training_model(actor_model, rollout_id, force_sync)
             if args.use_critic:
-                await save_training_model(critic_model, rollout_id, force_sync)
-            await rollout_executor.save(rollout_id)
-            if args.keep_recent_checkpoints is not None:
-                await asyncio.to_thread(
-                    checkpoint_decay.prune_checkpoints,
-                    args.save,
-                    saved_step=rollout_id,
-                    keep_recent=args.keep_recent_checkpoints,
-                    keep_every=args.keep_checkpoint_every,
-                    pin_saved=external_save,
+                values = await critic_model.train(rollout_id, rollout_data_curr_ref)
+                if args.offload_train:
+                    await critic_model.offload()
+                if rollout_id >= args.num_critic_only_steps:
+                    await actor_model.train(rollout_id, rollout_data_curr_ref, external_data=values)
+                    if args.offload_train:
+                        await actor_model.offload()
+                remove_train_output_refs(values)
+            else:
+                await actor_model.train(rollout_id, rollout_data_curr_ref)
+            remove_rollout_data_refs(args, rollout_data_curr_ref)
+            await rollout_executor.release(rollout_id)
+
+            external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
+            if external_save or should_run_periodic_action(
+                rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+            ):
+                force_sync = external_save or rollout_id == args.num_rollout - 1
+                await save_training_model(actor_model, rollout_id, force_sync)
+                if args.use_critic:
+                    await save_training_model(critic_model, rollout_id, force_sync)
+                await rollout_executor.save(rollout_id)
+                if args.keep_recent_checkpoints is not None:
+                    await asyncio.to_thread(
+                        checkpoint_decay.prune_checkpoints,
+                        args.save,
+                        saved_step=rollout_id,
+                        keep_recent=args.keep_recent_checkpoints,
+                        keep_every=args.keep_checkpoint_every,
+                        pin_saved=external_save,
+                    )
+                if external_save:
+                    os.remove(args.save_trigger_sentinel)
+
+            if args.colocate:
+                await offload_train()
+                if args.offload_rollout:
+                    await inference_controller.onload_weights()
+            if weight_update_due:
+                if not args.fully_async:
+                    # sync generate before update weights to prevent update weight in the middle of generation
+                    rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
+                    rollout_data_next_future = None
+                await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
+                if defer_next_drain and not args.colocate:
+                    rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
+            if args.colocate:
+                if args.offload_rollout:
+                    await inference_controller.onload_kv()
+                await inference_controller.continue_generation()
+                if rollout_id + 1 < args.num_rollout:
+                    rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
+
+            if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
+                await inference_controller.prepare_eval()
+                await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
+
+            if (
+                args.debug_exit_after_rollout is not None
+                and (rollout_id - args.start_rollout_id + 1) >= args.debug_exit_after_rollout
+            ):
+                logger.info(
+                    "debug_exit_after_rollout=%d reached at rollout_id=%d, exiting",
+                    args.debug_exit_after_rollout,
+                    rollout_id,
                 )
-            if external_save:
-                os.remove(args.save_trigger_sentinel)
-
-        if args.colocate:
-            await offload_train()
-            if args.offload_rollout:
-                await inference_controller.onload_weights()
-        if weight_update_due:
-            if not args.fully_async:
-                # sync generate before update weights to prevent update weight in the middle of generation
-                rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
-                rollout_data_next_future = None
-            await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
-            if defer_next_drain and not args.colocate:
-                rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
-        if args.colocate:
-            if args.offload_rollout:
-                await inference_controller.onload_kv()
-            await inference_controller.continue_generation()
-            if rollout_id + 1 < args.num_rollout:
-                rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
-
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
-            await inference_controller.prepare_eval()
-            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
-
-        if (
-            args.debug_exit_after_rollout is not None
-            and (rollout_id - args.start_rollout_id + 1) >= args.debug_exit_after_rollout
-        ):
-            logger.info(
-                "debug_exit_after_rollout=%d reached at rollout_id=%d, exiting",
-                args.debug_exit_after_rollout,
-                rollout_id,
-            )
-            break
+                break
 
 
 if __name__ == "__main__":

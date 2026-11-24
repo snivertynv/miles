@@ -319,6 +319,7 @@ class TrainRayActor(NodeProbeMixin):
     def kill_self(self) -> None:
         os._exit(1)
 
+    @observers.observed("clear_memory", category="offload")
     def clear_memory(self) -> None:
         print_memory("before TrainRayActor.clear_memory")
         clear_memory()

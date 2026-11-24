@@ -25,6 +25,9 @@ must not carry secrets, and workers the driver does not launch never see them.
 
 from __future__ import annotations
 
+import functools
+import inspect
+import itertools
 import json
 import logging
 import time
@@ -64,7 +67,7 @@ class RunStart(TypedDict):
 
 
 class ProcessStart(TypedDict):
-    role: str  # "driver", "train", "rollout_manager", "inference_controller", "command"
+    role: str  # "driver", "train", "trainer_controller", "rollout_manager", "inference_controller", "command"
     node: str  # the node's IP, as miles names nodes everywhere
     rank: int  # rank in its training group; -1 outside training
     gpus: list[int]  # physical GPU indices on the node held by this process
@@ -155,6 +158,29 @@ class TrainTokens(TypedDict):
     returns: np.ndarray | None
 
 
+SpanCategory = Literal[
+    "step", "init", "rollout", "dispatch", "train", "gpu", "weight_sync", "checkpoint", "offload", "engine", "eval"
+]
+SPAN_CATEGORIES: tuple[str, ...] = get_args(SpanCategory)
+
+
+class SpanStart(TypedDict):
+    """A unit of work this process began, reported by ``span`` and ``observed``."""
+
+    span_id: int  # unique within the process; pairs a start with its end
+    name: str
+    category: SpanCategory
+    t0: float
+    attributes: dict[str, str | int | float | bool]  # carries ``rollout_id`` when the work belongs to a step
+
+
+class SpanEnd(SpanStart):
+    """A finished unit of work. Spans measured after the fact (device time) arrive with no start."""
+
+    t1: float
+    error: str  # the exception type when the work raised, else ""
+
+
 class Observer:
     """What an observer can hear; every method defaults to doing nothing."""
 
@@ -188,6 +214,16 @@ class Observer:
 
     def train_tokens(self, rollout_id: int, *, rows: list[TrainTokens]) -> None: ...
 
+    def span_start(self, span: SpanStart) -> None: ...
+
+    def span_end(self, span: SpanEnd) -> None: ...
+
+    def wants_device_spans(self) -> bool:
+        """Whether to time device work (forward, backward, optimizer) with events, which
+        adds a synchronize at the start and end of each training call. Asked once per
+        process, after ``start_process``."""
+        return False
+
     def end_process(self) -> None:
         """The process is about to end: send or save what it still holds. A worker is
         killed once this returns or ``END_PROCESS_TIMEOUT_S`` passes. This can run on a
@@ -206,6 +242,8 @@ class Observers(metaclass=SingletonMeta):
     def __init__(self):
         self._observers = _load_observers()
         self._last_warning_of: dict[tuple[str, str], float] = {}
+        # asked on every ``span``, so decided once
+        self.hears_spans = self.hears("span_start") or self.hears("span_end")
 
     @property
     def active(self) -> bool:
@@ -266,6 +304,15 @@ class Observers(metaclass=SingletonMeta):
 
     def train_tokens(self, rollout_id: int, *, rows: list[TrainTokens]) -> None:
         self._each("train_tokens", rollout_id, rows=rows)
+
+    def span_start(self, span: SpanStart) -> None:
+        self._each("span_start", span)
+
+    def span_end(self, span: SpanEnd) -> None:
+        self._each("span_end", span)
+
+    def wants_device_spans(self) -> bool:
+        return self.hears_spans and any(self._each("wants_device_spans"))
 
     def end_process(self) -> None:
         self._each("end_process")
@@ -344,6 +391,87 @@ def start_process(role: str, *, rank: int = -1, gpus: Callable[[], Iterable[int]
     Timer().event_sinks.append(_PhaseReporter(observers))
     if role == "rollout_manager" and observers.hears("trajectory_event"):
         TrajectoryLifecycle().sink = _TrajectoryReporter(observers)
+
+
+_span_ids = itertools.count(1)
+
+
+def new_span_id() -> int:
+    return next(_span_ids)
+
+
+@contextmanager
+def span(name: str, *, category: SpanCategory, **attributes: Any) -> Iterator[None]:
+    """Report the enclosed work as a span. Free when no observer hears spans; may enclose ``await``."""
+    observers = Observers()
+    if not observers.hears_spans:
+        yield
+        return
+    start = SpanStart(
+        span_id=new_span_id(), name=name, category=category, t0=time.time(), attributes=_plain_attributes(attributes)
+    )
+    observers.span_start(start)
+    error = ""
+    try:
+        yield
+    except BaseException as e:
+        error = type(e).__name__
+        raise
+    finally:
+        observers.span_end(SpanEnd(**start, t1=time.time(), error=error))
+
+
+def observed(name: str | None = None, *, category: SpanCategory) -> Callable:
+    """``span`` as a decorator of a sync or async function, named after it by default.
+    A ``rollout_id`` argument becomes the span's ``rollout_id`` attribute."""
+
+    def decorate(fn: Callable) -> Callable:
+        signature = inspect.signature(fn)
+        takes_rollout_id = "rollout_id" in signature.parameters
+        span_name = name or fn.__name__
+
+        def attributes(args, kwargs) -> dict[str, Any]:
+            if not takes_rollout_id:
+                return {}
+            rollout_id = signature.bind_partial(*args, **kwargs).arguments.get("rollout_id")
+            return {} if rollout_id is None else {"rollout_id": rollout_id}
+
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args, **kwargs):
+                if not Observers().hears_spans:
+                    return await fn(*args, **kwargs)
+                with span(span_name, category=category, **attributes(args, kwargs)):
+                    return await fn(*args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not Observers().hears_spans:
+                return fn(*args, **kwargs)
+            with span(span_name, category=category, **attributes(args, kwargs)):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
+def report_spans(spans: Iterable[SpanEnd]) -> None:
+    """Report spans measured after the fact, such as device time read back from events."""
+    observers = Observers()
+    for finished in spans:
+        observers.span_end(finished)
+
+
+def _plain_attributes(attributes: dict[str, Any]) -> dict[str, str | int | float | bool]:
+    return {
+        key: value if isinstance(value, (str, int, float, bool)) else str(value)
+        for key, value in attributes.items()
+        if value is not None
+    }
 
 
 def _plain_args(args) -> dict[str, Any]:

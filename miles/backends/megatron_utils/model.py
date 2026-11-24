@@ -23,6 +23,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import get_model_config
 from megatron.training.training import get_model
 
+from miles.backends.megatron_utils.device_timeline import DeviceTimeline
 from miles.backends.megatron_utils.ft.indep_dp import allreduce_grads_and_losses_across_replicas
 from miles.backends.megatron_utils.lm_head import check_model_takes_output_processor, lm_head_forward_kwargs
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
@@ -43,6 +44,7 @@ from miles.backends.training_utils.model_companion import (
     SampleIdentityExtractor,
 )
 from miles.backends.training_utils.types import TrainStepOutcome
+from miles.utils import observers
 from miles.utils.args.runtime import TrainerConfig
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
@@ -338,6 +340,7 @@ def forward_only(
     config = get_model_config(model_chunks[0])
 
     @dumper_phase_util.wrap_forward_step
+    @DeviceTimeline().wrap_forward_step
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
     ) -> tuple[torch.Tensor, Callable[[torch.Tensor], dict[str, list[torch.Tensor]]]]:
@@ -421,16 +424,17 @@ def forward_only(
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
         # collect_non_loss_data
-        forward_data_store += forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=data_iterator,
-            model=model_chunks,
-            num_microbatches=num_microbatches[step_id],
-            seq_length=args.backend.seq_length,
-            micro_batch_size=args.backend.micro_batch_size,
-            forward_only=True,
-            collect_non_loss_data=True,
-        )
+        with DeviceTimeline().region("forward_only", step_id=step_id):
+            forward_data_store += forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model_chunks,
+                num_microbatches=num_microbatches[step_id],
+                seq_length=args.backend.seq_length,
+                micro_batch_size=args.backend.micro_batch_size,
+                forward_only=True,
+                collect_non_loss_data=True,
+            )
 
     # Move model back to the train mode.
     for model_module in model_chunks:
@@ -473,6 +477,7 @@ def run_forward_backward_pass(
     )
 
     @dumper_phase_util.wrap_forward_step
+    @DeviceTimeline().wrap_forward_step
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict]],
@@ -625,9 +630,10 @@ def train_one_step(
         fn_args = compute_custom_function_config(args, x)
         custom_before_train_step_hook(fn_args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
-    losses_reduced = run_forward_backward_pass(
-        args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
-    )
+    with DeviceTimeline().region("forward_backward", step_id=step_id):
+        losses_reduced = run_forward_backward_pass(
+            args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
+        )
     if args.enable_sample_ownership_checker:
         local_consumed_identities = SampleIdentityExtractor.get_consumed_sample_identities(
             start_offset=sample_consumption_start,
@@ -698,7 +704,8 @@ def train_one_step(
         dumper_phase_util.finalize(model)
 
     if not disable_optimizer and valid_step:
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        with DeviceTimeline().region("optimizer_step", step_id=step_id):
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         assert update_successful
         ModelCompanionWeightVersionUtils.bump_weight_version(model)
         opt_param_scheduler.step(increment=num_rollouts)
@@ -1053,6 +1060,7 @@ class LoadCheckpointOutput:
     schedule_first_rollout: int
 
 
+@observers.observed("rank.load_checkpoint", category="checkpoint")
 def load_model_state(
     args: TrainerConfig,
     *,

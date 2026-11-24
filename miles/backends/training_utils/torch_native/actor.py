@@ -41,6 +41,7 @@ from miles.backends.training_utils.weight_update.updater import WeightUpdater
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.rollout.train_data_conversion import process_rollout_data_shard
 from miles.ray.train_actor import TrainRayActor, WeightUpdateOutput
+from miles.utils import observers
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.dp_schedule import TrainParallelConfig
@@ -123,6 +124,7 @@ class TorchNativeTrainRayActor(TrainRayActor):
             ),
         )
 
+    @observers.observed("save_model", category="checkpoint")
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only or self.args.backend.save is None:
             return
@@ -150,6 +152,7 @@ class TorchNativeTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
         print_memory(f"after moving the model to {where}")
 
+    @observers.observed("rank.train_step", category="step")
     def train(
         self,
         rollout_id: int,
