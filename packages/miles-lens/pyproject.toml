@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "miles-lens"
+version = "0.1.0"
+description = "nemo-lens (OpenTelemetry) timeline of miles runs"
+requires-python = ">=3.11"
+# miles itself is not listed: the plugin runs inside a miles environment
+dependencies = [
+    "nemo-lens[sdk] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03",
+]
+
+[project.entry-points."miles.observers"]
+miles_lens = "miles_lens.observer:LensObserver"
+
+[tool.setuptools]
+packages = ["miles_lens"]
+
+[project.scripts]
+miles-lens-perfetto = "miles_lens.perfetto:main"
